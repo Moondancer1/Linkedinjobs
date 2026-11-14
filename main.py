@@ -1,4 +1,4 @@
-"""LinkedIn (EU) -> Telegram: бот слушает команды в чате и по ним запускает/останавливает поиск вакансий."""
+"""LinkedIn (EU) -> Telegram: бот слушает команды в чате и по ним ищет вакансии (/go) или кандидатов (/find)."""
 import html
 import json
 import logging
@@ -12,7 +12,7 @@ import threading
 import time
 from contextlib import closing
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -80,7 +80,10 @@ HELP = ("/go — начать поиск\n"
         "/period 1d — за какой период искать: 1h, 1d, 1w, 1m\n"
         "/maxcompany 2 — не больше N вакансий одной компании за проход (0 = без лимита)\n"
         "/delay 60 — пауза в секундах между карточками\n"
-        "/status — что сейчас происходит")
+        "/status — что сейчас происходит\n"
+        "\nПоиск кандидатов:\n"
+        "/find — спрошу должность, страну, город, образование, опыт и навыки и пришлю профили\n"
+        "/cancel — прервать вопросы")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jobs")
@@ -339,9 +342,15 @@ def send(text):
     return ok is not None
 
 
-def reply(text):
-    """Обычный текст ответа на команду."""
-    tg("sendMessage", chat_id=CHAT_ID, text=text)
+def reply(text, buttons=None):
+    """Обычный текст ответа на команду. buttons: подписи кнопок под полем ввода, [] — убрать кнопки."""
+    extra = {}
+    if buttons:
+        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        extra["reply_markup"] = {"keyboard": rows, "resize_keyboard": True, "one_time_keyboard": True}
+    elif buttons is not None:
+        extra["reply_markup"] = {"remove_keyboard": True}
+    tg("sendMessage", chat_id=CHAT_ID, text=text, **extra)
 
 
 def db_conn():
@@ -349,6 +358,7 @@ def db_conn():
     c.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, url TEXT, sent_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS fingerprints (fp TEXT PRIMARY KEY, seen_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS seen_profiles (slug TEXT PRIMARY KEY, seen_at TEXT)")
     return c
 
 
@@ -503,11 +513,304 @@ def running():
     return worker is not None and worker.is_alive()
 
 
-def handle(text):
+# ---------- Поиск кандидатов (/find) ----------
+# У LinkedIn нет открытого поиска людей, поэтому ищем через поисковик: site:linkedin.com/in + условия в кавычках.
+# В Telegram уходит только то, что вернул поисковик: заголовок, сниппет и ссылка на профиль.
+DDG = "https://html.duckduckgo.com/html/?q="
+CANDIDATE_PAGES = 5  # сколько страниц выдачи листать на один запрос
+PROFILE_RE = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/([^/?#\s]+)", re.I)
+SKIP, ANY, REPEAT, START, CANCEL = "Пропустить", "Любой", "Повторить прошлый поиск", "Искать", "Отмена"
+LEVELS = ("junior", "middle", "senior", "lead")  # уходят в запрос одним словом, остальное — фразой в кавычках
+STEPS = [  # (ключ, вопрос, кнопки)
+    ("role", "Кого ищем? Должность или специальность, варианты через запятую. Пишите на языке профилей "
+             "(обычно английский).\nПример: sound engineer, AV engineer", []),
+    ("country", "Страна или регион?\nПример: Azerbaijan", [SKIP]),
+    ("city", "Город?\nПример: Baku", [SKIP]),
+    ("education", "Образование: степень, специальность или вуз. Через запятую — все условия сразу.\n"
+                  "Пример: bachelor, Computer Engineering", [SKIP]),
+    ("experience", "Опыт? Выберите уровень или напишите своими словами, например: 5 years", [ANY, *LEVELS]),
+    ("skills", "Навыки или ключевые слова через запятую.\nПример: Dante, Crestron", [SKIP]),
+    ("limit", "Сколько профилей прислать?", ["10", "20", "30", "50"]),
+]
+LABELS = {"role": "Должность", "country": "Страна", "city": "Город", "education": "Образование",
+          "experience": "Опыт", "skills": "Навыки", "limit": "Сколько"}
+wizard = None  # диалог /find: {"step": номер вопроса, "data": ответы}; None — диалога нет
+
+
+class SearchBlocked(Exception):
+    """Поисковик отдал капчу или ошибку вместо выдачи."""
+
+
+def terms(csv):
+    return [t.strip() for t in csv.replace('"', "").split(",") if t.strip()]
+
+
+def build_queries(c):
+    """По одному запросу на каждый вариант должности: OR поисковик понимает ненадёжно."""
+    q = lambda t: f'"{t}"'
+    tail = [q(t) for key in ("city", "country", "education") for t in terms(c.get(key, ""))]
+    exp = " ".join(terms(c.get("experience", "")))
+    if exp:
+        tail.append(exp.lower() if exp.lower() in LEVELS else q(exp))
+    tail += [q(t) for t in terms(c.get("skills", ""))]
+    return [" ".join(["site:linkedin.com/in", q(role), *tail]) for role in terms(c["role"])]
+
+
+def name_from_slug(slug):
+    """«ruslan-aliyev-1a2b3c» → «Ruslan Aliyev»: запасной заголовок, когда поисковик его не дал."""
+    words = [w for w in unquote(slug).split("-") if w and not any(ch.isdigit() for ch in w)]
+    return " ".join(w.capitalize() for w in words) or slug
+
+
+def parse_profiles(anchors):
+    """Ссылки со страницы выдачи [href, текст, class, текст блока] → профили LinkedIn без повторов."""
+    found = {}
+    for href, text, cls, box in anchors:
+        href = href or ""
+        if "uddg=" in href:  # DuckDuckGo заворачивает ссылки в редирект /l/?uddg=<адрес>
+            href = parse_qs(urlparse(href).query).get("uddg", [""])[0]
+        m = PROFILE_RE.match(href)
+        if not m:
+            continue
+        p = found.setdefault(m.group(1).lower(), {
+            "slug": m.group(1).lower(), "url": f"https://www.linkedin.com/in/{m.group(1)}",
+            "title": "", "snippet": "", "box": box or ""})
+        text = " ".join((text or "").split())
+        if not text or "linkedin.com" in text.lower():
+            continue  # ссылка-адрес под заголовком
+        if "snippet" in (cls or ""):
+            p["snippet"] = text
+        elif not p["title"]:
+            p["title"] = text
+        elif not p["snippet"]:
+            p["snippet"] = text
+    for p in found.values():
+        p["title"] = re.sub(r"\s*[|\-–]\s*LinkedIn\s*$", "", p["title"]) or name_from_slug(p["slug"])
+        box = [" ".join(ln.split()) for ln in p.pop("box").splitlines()]
+        if not p["snippet"]:  # сниппет оказался не ссылкой: берём остальной текст блока
+            p["snippet"] = " ".join(ln for ln in box if ln and "linkedin.com" not in ln.lower()
+                                    and not ln.startswith(p["title"]))
+        p["snippet"] = p["snippet"][:500]
+    return list(found.values())
+
+
+def ddg_search(page, query):
+    """Листает выдачу DuckDuckGo и отдаёт профили. SearchBlocked — если вместо выдачи капча."""
+    if not fetch(page, DDG + quote_plus(query)):
+        raise SearchBlocked(query)
+    for n in range(CANDIDATE_PAGES):
+        anchors = page.eval_on_selector_all("a[href]", """els => els.map(a => [
+            a.getAttribute('href'), a.innerText, a.getAttribute('class') || '',
+            (a.closest('.result, .web-result, article, li') || {}).innerText || ''])""")
+        found = parse_profiles(anchors)
+        log.info("  страница %d: профилей %d", n + 1, len(found))
+        if not found:
+            if n == 0 and page.query_selector(".anomaly-modal, #challenge-form"):
+                raise SearchBlocked(query)
+            return
+        yield from found
+        nxt = page.query_selector("input[type=submit][value=Next]")
+        if not nxt or stop_event.is_set():
+            return
+        human_pause()
+        try:
+            nxt.click()
+            page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        except PlaywrightError:
+            return
+
+
+def resolve_redirect(uri):
+    """Gemini отдаёт источники ссылками-редиректами: достаём настоящий адрес, сам LinkedIn не открываем."""
+    if not uri or PROFILE_RE.match(uri):
+        return uri or ""
+    try:
+        return requests.get(uri, allow_redirects=False, timeout=20).headers.get("Location", "")
+    except requests.RequestException:
+        return ""
+
+
+def gemini_search(query):
+    """Запасной поиск: Gemini с Google Search. Профили берём только из списка источников, а не из текста ответа."""
+    prompt = (f"Выполни поиск Google по запросу: {query}\n"
+              "Перечисли найденные профили LinkedIn: имя, должность, компания, город. "
+              "Пиши только то, что есть в результатах поиска.")
+    try:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json={"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]},
+            timeout=90)
+        r.raise_for_status()
+        meta = r.json()["candidates"][0].get("groundingMetadata", {})
+    except Exception as e:
+        log.warning("Gemini-поиск не ответил: %s", type(e).__name__)
+        return []
+    out = []
+    for i, chunk in enumerate(meta.get("groundingChunks", [])):
+        m = PROFILE_RE.match(resolve_redirect(chunk.get("web", {}).get("uri", "")))
+        if not m:
+            continue
+        notes = " ".join(s.get("segment", {}).get("text", "") for s in meta.get("groundingSupports", [])
+                         if i in s.get("groundingChunkIndices", []))
+        out.append({"slug": m.group(1).lower(), "url": f"https://www.linkedin.com/in/{m.group(1)}",
+                    "title": name_from_slug(m.group(1)), "snippet": " ".join(notes.split())[:500], "ai": True})
+    log.info("  Gemini: профилей %d", len(out))
+    return out
+
+
+def format_profile(p):
+    e = html.escape
+    lines = [f"<b>👤 {e(p['title'])}</b>"]
+    if p["snippet"]:
+        lines += ["", e(p["snippet"])]
+    if p.get("ai"):
+        lines.append("ℹ️ Описание составил Gemini по выдаче Google, сверьте с профилем")
+    lines += ["", f'<a href="{e(p["url"])}">🔗 Открыть профиль</a>']
+    return "\n".join(lines)[:4096]
+
+
+def run_candidates(c):
+    limit = int(c.get("limit") or 20)
+    queries = build_queries(c)
+    sent = found = 0
+    blocked = False
+
+    def deliver(db, profiles):
+        nonlocal sent, found
+        for p in profiles:
+            if stop_event.is_set() or sent >= limit:
+                return
+            found += 1
+            if db.execute("SELECT 1 FROM seen_profiles WHERE slug=?", (p["slug"],)).fetchone():
+                continue  # уже присылал
+            if send(format_profile(p)):
+                db.execute("INSERT OR IGNORE INTO seen_profiles VALUES (?, datetime('now'))", (p["slug"],))
+                db.commit()
+                sent += 1
+
+    log.info("Поиск кандидатов запущен")
+    try:
+        with closing(db_conn()) as db:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=HEADLESS)
+                try:
+                    page = browser.new_context(user_agent=random.choice(USER_AGENTS), locale="en-US").new_page()
+                    for query in queries:
+                        if stop_event.is_set() or sent >= limit:
+                            break
+                        log.info("Кандидаты: %s", query)
+                        try:
+                            deliver(db, ddg_search(page, query))
+                        except SearchBlocked:
+                            log.warning("Поисковик отдал капчу или ошибку")
+                            blocked = True
+                            break
+                        human_pause()
+                finally:
+                    browser.close()
+            if GEMINI_API_KEY and (blocked or not found):  # запасной путь, когда основной ничего не дал
+                for query in queries:
+                    if stop_event.is_set() or sent >= limit:
+                        break
+                    log.info("Кандидаты через Gemini: %s", query)
+                    deliver(db, gemini_search(query))
+    except Exception as e:
+        log.exception("Поиск кандидатов упал")
+        reply(f"Поиск кандидатов упал с ошибкой ({type(e).__name__}), подробности в логе. /find — запустить снова.")
+        return
+    log.info("Поиск кандидатов закончен: найдено %d, отправлено %d", found, sent)
+    if stop_event.is_set():
+        reply(f"Поиск остановлен. Прислал профилей: {sent}.")
+    elif sent:
+        reply(f"Готово. Прислал профилей: {sent}. /find → «{REPEAT}» пришлёт следующих, без повторов.")
+    elif found:
+        reply("Новых профилей нет: всех найденных я уже присылал.")
+    elif blocked:
+        reply("Поисковик попросил капчу. Подождите 10–15 минут и повторите /find."
+              + ("" if GEMINI_API_KEY else " Запасной поиск включится, если вписать GEMINI_API_KEY в .env."))
+    else:
+        reply("Ничего не нашёл. Ослабьте условия: уберите город, образование или навыки.\nЗапросы были:\n"
+              + "\n".join(queries))
+
+
+def start_candidates(c):
     global worker
+    stop_event.clear()
+    worker = threading.Thread(target=run_candidates, args=(c,), daemon=True)
+    worker.start()
+
+
+def saved_criteria():
+    raw = get_setting("candidate", "")
+    return json.loads(raw) if raw else None
+
+
+def question(step, data):
+    """Текст и кнопки очередного вопроса; после последнего — сводка с подтверждением."""
+    if step == len(STEPS):
+        lines = [f"{LABELS[k]}: {data.get(k) or '—'}" for k, _, _ in STEPS]
+        return ("Проверьте условия:\n" + "\n".join(lines) + "\n\nЗапросы в поисковик:\n"
+                + "\n".join(build_queries(data)) + f"\n\n«{START}» или «{CANCEL}»?"), [START, CANCEL]
+    _, text, buttons = STEPS[step]
+    if step == 0 and saved_criteria():
+        buttons = [REPEAT]
+    return f"{step + 1}/{len(STEPS)}. {text}", buttons
+
+
+def wizard_start():
+    global wizard
+    wizard = {"step": 0, "data": {}}
+    return question(0, {})
+
+
+def wizard_answer(text):
+    """Ответ пользователя на текущий вопрос /find → следующий вопрос (текст, кнопки)."""
+    global wizard
+    text = " ".join(text.split())
+    step, data = wizard["step"], wizard["data"]
+    if step == len(STEPS):  # ждём подтверждение
+        if text.lower() == CANCEL.lower():
+            wizard = None
+            return "Отменил.", []
+        if text.lower() != START.lower():
+            return question(step, data)
+        wizard = None
+        if running():
+            return "Сейчас идёт поиск. Сначала /stop, потом /find.", []
+        set_setting("candidate", json.dumps(data, ensure_ascii=False))
+        start_candidates(data)
+        return "Ищу кандидатов. /stop — остановить.", []
+    key = STEPS[step][0]
+    if step == 0 and text == REPEAT and saved_criteria():
+        wizard = {"step": len(STEPS), "data": saved_criteria()}
+        return question(len(STEPS), wizard["data"])
+    value = "" if text.lower() in (SKIP.lower(), ANY.lower(), "-") else text
+    if key == "role" and not terms(value):
+        return question(step, data)
+    if key == "limit" and not (value.isdigit() and 1 <= int(value) <= 100):
+        return "Напишите число от 1 до 100.", STEPS[step][2]
+    data[key] = value
+    wizard["step"] += 1
+    return question(wizard["step"], data)
+
+
+def handle(text):
+    global worker, wizard
     cmd, _, arg = text.strip().partition(" ")
     cmd = cmd.split("@")[0].lower()  # /go@my_bot → /go
     arg = arg.strip()
+
+    if cmd == "/find":
+        if running():
+            return "Сейчас идёт поиск. Сначала /stop."
+        return wizard_start()
+
+    if cmd == "/cancel":
+        if wizard is None:
+            return "Вопросов сейчас нет. /find — начать поиск кандидатов."
+        wizard = None
+        return "Отменил.", []
 
     if cmd == "/go":
         if running():
@@ -611,13 +914,13 @@ def poll():
             if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
                 continue  # команды принимаем только из своего чата
             text = msg.get("text", "")
-            if text.startswith("/"):
+            if text.startswith("/") or (wizard is not None and text.strip()):
                 try:
-                    answer = handle(text)
+                    answer = handle(text) if text.startswith("/") else wizard_answer(text)
                 except Exception as e:
                     log.exception("Команда упала")
                     answer = f"Ошибка: {e}"
-                reply(answer)
+                reply(*answer) if isinstance(answer, tuple) else reply(answer)  # (текст, кнопки) или текст
 
 
 def build_env(token, chat_id, template):
